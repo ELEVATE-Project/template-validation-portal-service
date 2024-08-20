@@ -18,6 +18,8 @@ from bson import json_util
 # importing ObjectId from bson library
 from bson.objectid import ObjectId
 from datetime import datetime
+import subprocess
+# from backend.src.main.modules.helper import *
 
 
 
@@ -25,6 +27,11 @@ from datetime import datetime
 sys.path.append('../../..')
 sys.path.append('../../../backend/src/main/modules/')
 from backend.src.main.modules.xlsxObject import xlsxObject
+from backend.src.main.modules.survey import SurveyCreate
+from backend.src.main.modules.helper import Helpers
+# from backend.src.main.modules.commom_config import config.ini
+# from backend.src.main.modules import main
+
 
 def myconverter(obj):
         if isinstance(obj, np.integer):
@@ -38,6 +45,7 @@ def myconverter(obj):
 
 
 STATIC_PATH = os.path.join(os.getcwd(),"tmp")
+
 
 app = Flask(__name__,static_url_path="/tmp/")
 
@@ -58,6 +66,7 @@ def connectDb(url,db,collection):
     client = pymongo.MongoClient(url)
     db = client[db]
     collectionData = db[collection]
+    print("collectionData",collectionData)
     return collectionData
 
 def addComments(templatePath, errResponse):
@@ -391,6 +400,7 @@ def upload():
     else:
 
         # decode the payload with signing_key to check if the user is authentic 
+        # print("=-=-=-==-=-> ",auth)
         payload = jwt.decode(auth, signing_key, algorithms=['HS256'])
 
     if(not payload):
@@ -458,6 +468,8 @@ def validate():
     
 
     basicErrors = xlsxObject(templateCode, templateFolderPath)
+    print
+    # main
 
     if basicErrors.success:
         valErr = basicErrors.basicCondition()
@@ -497,8 +509,9 @@ def update():
     result = {}
 
     req_body = request.get_json()
-
     auth = request.headers.get('admin-token')
+    request["auth"] = auth
+
 
     # Auth code check
     if(not auth):
@@ -816,7 +829,34 @@ def update_conditions(_id):
     except Exception as e:
         # Handle unexpected exceptions and return a generic error message
         return jsonify({"status": 500, "code": "Internal Server Error", "result": [{"message": "An error occurred"}]})
-        
+    
+
+@app.route('/template/api/v1/survey/getSolutions', methods=['POST'])
+def fetchSurveySolutions():
+    resurceType = request.get_json()
+
+    survey = SurveyCreate()
+    access_token = survey.generate_access_token()
+    fetchedSolutionList=survey.fetch_solution_id(access_token,resurceType['resourceType'])
+
+    if fetchedSolutionList:
+        return jsonify({"status": 200, "code": "Success","SolutionList":fetchedSolutionList})
+    
+    else:
+        return jsonify({"status": 400, "code": "NOTOK","SolutionList":"Error in getting the list of solutions"})
+
+
+@app.route('/template/api/v1/survey/create', methods=['POST'])
+def create():
+    req = request.get_json()
+    helperInstance = Helpers
+    resourceFile=helperInstance.loadSurveyFile(req['file'])
+
+    if resourceFile:
+        return jsonify({"status": 200, "code": "Success", "result": [{"solutionId":resourceFile[0],"successSheet":resourceFile[1],"downloadbleUrl":resourceFile[2]}]})
+    else :
+        return jsonify({"status": 500, "code": "NOTOK","massege":"Could not create survey solution"})
+    
 if (__name__ == '__main__'):
     app.run(host=os.environ.get("HOSTIP")  , port=os.environ.get("FLASK_RUN_PORT") , debug=True)
     
