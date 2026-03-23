@@ -18,8 +18,9 @@ from bson import json_util
 # importing ObjectId from bson library
 from bson.objectid import ObjectId
 from datetime import datetime
+import bcrypt
 import subprocess
-# from backend.src.main.modules.helper import *
+
 
 
 
@@ -27,11 +28,6 @@ import subprocess
 sys.path.append('../../..')
 sys.path.append('../../../backend/src/main/modules/')
 from backend.src.main.modules.xlsxObject import xlsxObject
-from backend.src.main.modules.survey import SurveyCreate
-from backend.src.main.modules.helper import Helpers
-# from backend.src.main.modules.commom_config import config.ini
-# from backend.src.main.modules import main
-
 
 def myconverter(obj):
         if isinstance(obj, np.integer):
@@ -45,7 +41,6 @@ def myconverter(obj):
 
 
 STATIC_PATH = os.path.join(os.getcwd(),"tmp")
-
 
 app = Flask(__name__,static_url_path="/tmp/")
 
@@ -66,7 +61,6 @@ def connectDb(url,db,collection):
     client = pymongo.MongoClient(url)
     db = client[db]
     collectionData = db[collection]
-    # print("collectionData",collectionData)
     return collectionData
 
 def addComments(templatePath, errResponse):
@@ -151,91 +145,115 @@ def addComments(templatePath, errResponse):
     return errResponse
 
 # Login user API 
-@app.route("/template/api/v1/authenticate", methods = ['POST'])
+@app.route("/template/api/v1/authenticate", methods=['POST'])
 def login():
-    req_body = request.get_json()
     try:
-        # get the user name from request 
-        userName = req_body['request']['email']
-        # get the password from request and hash it in md5 
-        password = hashlib.md5(req_body['request']['password'].encode('utf-8'))
+        req = request.get_json()['request']
+        userName, raw_password = req['email'], req['password']
 
-        # connect to user collection 
-        usersCollection = connectDb(os.environ.get('mongoURL'),os.environ.get('db'),'userCollection')
-        
-        # query the username and hashed password pair is present in DB
-        users = usersCollection.count_documents({'userName' : userName , "password" : str(password.hexdigest())})
+        usersCollection = connectDb(os.environ.get('mongoURL'),
+                                    os.environ.get('db'),
+                                    'userCollection')
 
-        # check the user result 
-        if(users):
-            # Exipry and other details can be added here
-            message = {
-                'iss': '',
-                'email': userName
+        user = usersCollection.find_one({'userName': userName})
+        if not user:
+            return {"status":404,"code":"Error","errorFlag":True,
+                    "error":["Username / Password Doesn't Match"],
+                    "response":{"accessToken":""}}
+
+        stored = user.get("password")
+        ptype = user.get("passwordType", "md5")
+
+        # 🔐 bcrypt check OR md5 fallback
+        valid = (
+            bcrypt.checkpw(raw_password.encode(), stored.encode())
+            if ptype == "bcrypt"
+            else hashlib.md5(raw_password.encode()).hexdigest() == stored
+        )
+
+        # 🔁 upgrade md5 → bcrypt
+        if valid and ptype != "bcrypt":
+            usersCollection.update_one({'_id': user['_id']}, {
+                "$set": {
+                    "password": bcrypt.hashpw(raw_password.encode(), bcrypt.gensalt()).decode(),
+                    "passwordType": "bcrypt"
                 }
-            
-            # secret key from the env file 
-            signing_key = os.environ.get("SECRET_KEY")
-            # encode the user name and expiry to create a token 
-            try:
-                encoded_jwt = jwt.encode({'message': message}, signing_key, algorithm='HS256')
-            except Exception as e:
-                encoded_jwt = ""
-                print(e)
+            })
 
-            # return the token after successful authentication 
-            return {"status" : 200,"code" : "Authenticated","errorFlag" : False,"error" : [],"response" : {
-                "accessToken" : encoded_jwt
-            }}
-        else:
-            # return authentication failed error 
-            return {"status" : 404,"code" : "Error","errorFlag" : True,"error" : ["Username / Password Doesn't Match"],"response" : {
-                "accessToken" : "" }}
+        if not valid:
+            return {"status":404,"code":"Error","errorFlag":True,
+                    "error":["Username / Password Doesn't Match"],
+                    "response":{"accessToken":""}}
+
+        token = jwt.encode(
+            {'message': {'iss':'','email':userName}},
+            os.environ.get("SECRET_KEY"),
+            algorithm='HS256'
+        )
+
+        return {"status":200,"code":"Authenticated","errorFlag":False,
+                "error":[],"response":{"accessToken":token}}
+
     except Exception as e:
-        # throw the error 
-        return {"status" : 500,"code" : str(e) ,"errorFlag" : True,"error" : ["Error in reaching server"],"response" : {
-                "accessToken" : "" }}
+        return {"status":500,"code":str(e),"errorFlag":True,
+                "error":["Error in reaching server"],
+                "response":{"accessToken":""}}
+
 
 # sign up API
 @app.route("/template/api/v1/signup", methods = ['POST'])
 def signup():
     req_body = request.get_json()
-    # get the 'admin-token' from the request header 
-    # auth = request.headers.get('admin-token')
-    # # check for the auth token 
-    # if(not auth):
-    #     # if the auth token is missing return authorization failed 
-    #     return {"status" : 500,"code" : "Authorization Failed" , "result" : {"templateLinks" : ""}}
-    # else:
-    #     # the auth token is present in the header and check the token present in the env file 
-    #     if not auth == os.environ.get('admin-token'):
-    #         return {"status" : 500,"code" : "Not Authorized" , "result" : {"templateLinks" : ""}}
 
-    # if auth is checked 
+    auth = request.headers.get('admin-token')
+    if(not auth):
+        return {"status":500,"code":"Authorization Failed","result":{"templateLinks":""}}
+    if not auth == os.environ.get('admin-token'):
+        return {"status":500,"code":"Not Authorized","result":{"templateLinks":""}}
+
     try:
-        # get the username from request body 
         userName = req_body['request']['email']
-        # get the password from request body and hash it
-        password = hashlib.md5(req_body['request']['password'].encode('utf-8'))
-        # connect to users collection in mongo DB
-        usersCollection = connectDb(os.environ.get('mongoURL'),os.environ.get('db'),'userCollection')
+        raw_password = req_body['request']['password']
 
-        # get the current time 
+        usersCollection = connectDb(os.environ.get('mongoURL'),
+                                    os.environ.get('db'),
+                                    'userCollection')
+
         now = datetime.now()
-        # query the given username
-        users = usersCollection.count_documents({'userName' : userName})
-        # check if the username is already present or not 
+        users = usersCollection.count_documents({'userName': userName})
+
         if(users <= 0):
-            # not present create the user in DB 
-            users = usersCollection.insert_one({'userName' : userName , "password" : str(password.hexdigest()),"status" : "active","role" : "admin","createdAt" : str(now),"updatedAt" : str(now),"createdBy" : "admin"})
-            # return success message 
-            return {"status" : 200,"code" : "Authenticated","errorFlag" : False,"error" : [],"response" : "User created Successfully."}
+            # 🔐 bcrypt instead of MD5
+            hashed_password = bcrypt.hashpw(
+                raw_password.encode('utf-8'),
+                bcrypt.gensalt()
+            ).decode('utf-8')
+
+            usersCollection.insert_one({
+                'userName': userName,
+                "password": hashed_password,
+                "passwordType": "bcrypt",   # 👈 small addition
+                "status": "active",
+                "role": "admin",
+                "createdAt": str(now),
+                "updatedAt": str(now),
+                "createdBy": "admin"
+            })
+
+            return {"status":200,"code":"Authenticated","errorFlag":False,
+                    "error":[],"response":"User created Successfully."}
+
         else:
-            # return user already exists 
-            return {"status" : 404,"code" : "Error","errorFlag" : True,"error" : ["UserName already exisiting."],"response" : {"accessToken" : "" }}
+            return {"status":404,"code":"Error","errorFlag":True,
+                    "error":["UserName already exisiting."],
+                    "response":{"accessToken":""}}
+
     except Exception as e:
-        # return error 
-        return {"status" : 500,"code" : str(e) ,"errorFlag" : True,"error" : ["Error in reaching server"],"response" : {"accessToken" : "" }}
+        return {"status":500,"code":str(e),"errorFlag":True,
+                "error":["Error in reaching server"],
+                "response":{"accessToken":""}}
+
+                
 
 # sample template downloader api
 @app.route("/template/api/v1/download/sampleTemplate", methods = ['GET'])
@@ -389,22 +407,21 @@ def sampleUpdate(code):
 def upload():
 
     # get auth Token for validation
-    # auth = request.headers.get('Authorization')
-    # # get SECRET_KEY for validation
-    # signing_key = os.environ.get("SECRET_KEY")
+    auth = request.headers.get('Authorization')
+    # get SECRET_KEY for validation
+    signing_key = os.environ.get("SECRET_KEY")
 
-    # payload = False
-    # # check if auth token is present in the header 
-    # if(not auth):
-    #     return {"status" : 500,"code" : "Authorization Failed" , "result" : {"templateLinks" : ""}}
-    # else:
+    payload = False
+    # check if auth token is present in the header 
+    if(not auth):
+        return {"status" : 500,"code" : "Authorization Failed" , "result" : {"templateLinks" : ""}}
+    else:
 
-    #     # decode the payload with signing_key to check if the user is authentic 
-    #     # print("=-=-=-==-=-> ",auth)
-    #     payload = jwt.decode(auth, signing_key, algorithms=['HS256'])
+        # decode the payload with signing_key to check if the user is authentic 
+        payload = jwt.decode(auth, signing_key, algorithms=['HS256'])
 
-    # if(not payload):
-    #     return {"status" : 500,"code" : "Authorization Failed" , "result" : {"templateLinks" : "True"}}
+    if(not payload):
+        return {"status" : 500,"code" : "Authorization Failed" , "result" : {"templateLinks" : "True"}}
     
     # set the allowed extensions to upload 
     ALLOWED_EXTENSIONS = set(['xlsx'])
@@ -452,24 +469,22 @@ def validate():
     templateCode = req_body["request"]["templateCode"]
 
     # Token validation
-    # auth = request.headers.get("Authorization")
-    # signing_key = os.environ.get("SECRET_KEY")
-    # payload = False
-    # if(not auth):
-    #     return {"status" : 500,"code" : "Authorization Failed" , "result" : {"templateLinks" : ""}}
-    # else:
-    #     try:
-    #         payload = jwt.decode(auth, signing_key, algorithms=['HS256'])
-    #     except Exception as e:
-    #         print(e)
+    auth = request.headers.get("Authorization")
+    signing_key = os.environ.get("SECRET_KEY")
+    payload = False
+    if(not auth):
+        return {"status" : 500,"code" : "Authorization Failed" , "result" : {"templateLinks" : ""}}
+    else:
+        try:
+            payload = jwt.decode(auth, signing_key, algorithms=['HS256'])
+        except Exception as e:
+            print(e)
 
-    # if(not payload):
-    #     return {"status" : 500,"code" : "Authorization Failed" , "result" : {"templateLinks" : "True"}}
+    if(not payload):
+        return {"status" : 500,"code" : "Authorization Failed" , "result" : {"templateLinks" : "True"}}
     
 
     basicErrors = xlsxObject(templateCode, templateFolderPath)
-    print
-    # main
 
     if basicErrors.success:
         valErr = basicErrors.basicCondition()
@@ -509,9 +524,8 @@ def update():
     result = {}
 
     req_body = request.get_json()
-    auth = request.headers.get('admin-token')
-    request["auth"] = auth
 
+    auth = request.headers.get('admin-token')
 
     # Auth code check
     if(not auth):
@@ -829,93 +843,7 @@ def update_conditions(_id):
     except Exception as e:
         # Handle unexpected exceptions and return a generic error message
         return jsonify({"status": 500, "code": "Internal Server Error", "result": [{"message": "An error occurred"}]})
-    
-
-@app.route('/template/api/v1/survey/getSolutions', methods=['POST'])
-def fetchSurveySolutions():
-    resurceType = request.get_json()
-    # Token validation
-    # auth = request.headers.get("Authorization")
-    # signing_key = os.environ.get("SECRET_KEY")
-    # payload = False
-    # if(not auth):
-    #     return {"status" : 500,"code" : "Authorization Failed" , "result" : {"templateLinks" : ""}}
-    # else:
-    #     try:
-    #         payload = jwt.decode(auth, signing_key, algorithms=['HS256'])
-    #     except Exception as e:
-    #         print(e)
-
-    # if(not payload):
-    #     return {"status" : 500,"code" : "Authorization Failed" , "result" : {"templateLinks" : "True"}}
-
-    survey = SurveyCreate()
-    access_token = survey.generate_access_token()
-    fetchedSolutionList=survey.fetch_solution_id(access_token,resurceType['resourceType'])
-
-    if fetchedSolutionList:
-        return jsonify({"status": 200, "code": "Success","SolutionList":fetchedSolutionList})
-    
-    else:
-        return jsonify({"status": 400, "code": "NOTOK","SolutionList":"Error in getting the list of solutions"})
-
-
-
-@app.route('/template/api/v1/survey/downloadSolutions', methods=['POST'])
-def fetchSurveySolutions_Csv():
-    resurceType = request.get_json()
-
-    # Token validation
-    # auth = request.headers.get("Authorization")
-    # signing_key = os.environ.get("SECRET_KEY")
-    # payload = False
-    # if(not auth):
-    #     return {"status" : 500,"code" : "Authorization Failed" , "result" : {"templateLinks" : ""}}
-    # else:
-    #     try:
-    #         payload = jwt.decode(auth, signing_key, algorithms=['HS256'])
-    #     except Exception as e:
-    #         print(e)
-
-    # if(not payload):
-    #     return {"status" : 500,"code" : "Authorization Failed" , "result" : {"templateLinks" : "True"}}
-
-    survey = SurveyCreate()
-    access_token = survey.generate_access_token()
-    csvFilePath=survey.fetch_solution_id_csv(access_token,resurceType['resourceType'])
-
-    if csvFilePath:
-        return jsonify({"status": 200, "code": "Success","csvFilePath":csvFilePath})
-    
-    else:
-        return jsonify({"status": 400, "code": "NOTOK","SolutionList":"Error in getting the list of solutions"})
-
-
-@app.route('/template/api/v1/survey/create', methods=['POST'])
-def create():
-    req = request.get_json()
-    helperInstance = Helpers
-    resourceFile=helperInstance.loadSurveyFile(req['file'])
-    # Token validation
-    # auth = request.headers.get("Authorization")
-    # signing_key = os.environ.get("SECRET_KEY")
-    # payload = False
-    # if(not auth):
-    #     return {"status" : 500,"code" : "Authorization Failed" , "result" : {"templateLinks" : ""}}
-    # else:
-    #     try:
-    #         payload = jwt.decode(auth, signing_key, algorithms=['HS256'])
-    #     except Exception as e:
-    #         print(e)
-
-    # if(not payload):
-    #     return {"status" : 500,"code" : "Authorization Failed" , "result" : {"templateLinks" : "True"}}
-
-    if resourceFile:
-        return jsonify({"status": 200, "code": "Success", "result": [{"solutionId":resourceFile[0],"successSheet":resourceFile[1],"downloadbleUrl":resourceFile[2]}]})
-    else :
-        return jsonify({"status": 500, "code": "NOTOK","massege":"Could not create survey solution"})
-    
+        
 if (__name__ == '__main__'):
     app.run(host=os.environ.get("HOSTIP")  , port=os.environ.get("FLASK_RUN_PORT") , debug=True)
     
